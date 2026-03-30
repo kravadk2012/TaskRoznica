@@ -32,6 +32,12 @@ USERS = {
 
 ADMIN_ID = "445734805"
 
+# Тексты кнопок меню — не должны попадать в текст задачи
+MENU_BUTTONS = {
+    "📋 Новая задача", "🕐 В работе", "🔍 На проверке",
+    "✅ Выполненные", "📊 Отчёт", "📋 Мои задачи",
+    "📌 Поставить задачу", "❓ Вопрос руководителю",
+}
 tasks: dict = {}
 task_counter = 0
 
@@ -79,6 +85,10 @@ class EditTask(StatesGroup):
     entering_manual_new_deadline = State()
 
 
+class AddComment(StatesGroup):
+    waiting_comment = State()
+
+
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 def kb_main_admin():
     return ReplyKeyboardMarkup(
@@ -86,6 +96,7 @@ def kb_main_admin():
             [KeyboardButton(text="📋 Новая задача")],
             [KeyboardButton(text="🕐 В работе"), KeyboardButton(text="🔍 На проверке")],
             [KeyboardButton(text="✅ Выполненные"), KeyboardButton(text="📊 Отчёт")],
+            [KeyboardButton(text="📋 Мои задачи")],
         ],
         resize_keyboard=True, persistent=True
     )
@@ -121,22 +132,27 @@ def kb_assignee_select(selected: list):
 
 
 def kb_task_action(task_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Выполнено", callback_data=f"done_{task_id}"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"done_{task_id}")],
+        [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"comment_{task_id}")],
+    ])
 
 
 def kb_control(task_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Контроль пройден", callback_data=f"approve_{task_id}"),
-        InlineKeyboardButton(text="🔄 Вернуть в работу", callback_data=f"return_{task_id}"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Контроль пройден", callback_data=f"approve_{task_id}"),
+            InlineKeyboardButton(text="🔄 Вернуть в работу", callback_data=f"return_{task_id}"),
+        ],
+        [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"comment_{task_id}")],
+    ])
 
 
 def kb_edit_task(task_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"edit_text_{task_id}")],
         [InlineKeyboardButton(text="📅 Изменить срок", callback_data=f"edit_date_{task_id}")],
+        [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"comment_{task_id}")],
         [InlineKeyboardButton(text="🔴 Закрыть принудительно", callback_data=f"force_close_{task_id}")],
     ])
 
@@ -169,6 +185,36 @@ def is_overdue(task: dict) -> bool:
     if isinstance(d, str):
         d = date.fromisoformat(d)
     return d < date.today() and task["status"] in ("open", "checking")
+
+
+def format_task_card(t: dict) -> str:
+    """Универсальная карточка задачи с блоком комментариев"""
+    if is_overdue(t):
+        icon = "🔴"
+    elif t["status"] == "checking":
+        icon = "🔍"
+    else:
+        icon = "🕐"
+    tag = "❓" if t.get("type") == "question" else "📌" if t.get("from_uid") != ADMIN_ID else "📋"
+    names = [USERS[a]["name"] for a in t.get("assignees", []) if a in USERS and a != ADMIN_ID]
+
+    text = (
+        f"{tag}{icon} <b>#{t['id']}</b> {t['text']}\n"
+        f"👤 {', '.join(names) or t.get('from_name', '—')} | 📅 {deadline_str(t)}"
+    )
+
+    # Блок комментариев
+    remarks = t.get("remarks", [])
+    comments = t.get("comments", [])
+    if remarks or comments:
+        text += "\n\n💬 <b>Комментарии:</b>\n" + "─" * 20
+        for r in remarks:
+            text += f"\n🔄 <b>Замечание</b> [{r['at']}]\n{r['text']}"
+        for c in comments:
+            photo = "📷 " if c.get("has_photo") else ""
+            text += f"\n👤 <b>{c['from']}</b> [{c['at']}]\n{photo}{c['text']}"
+
+    return text
 
 
 def format_my_tasks(uid: str) -> str:
@@ -210,11 +256,12 @@ async def cmd_start(message: Message):
         return
     if is_admin(uid):
         await message.answer(f"👋 Привет, {user['name']}! Выбери действие 👇",
-                             reply_markup=kb_main_admin())
+                             reply_markup=kb_main_admin(), disable_notification=True)
     else:
         tasks_text = format_my_tasks(uid)
         await message.answer(f"👋 {user['name']}, добро пожаловать!\n\n{tasks_text}",
-                             parse_mode="HTML", reply_markup=kb_main_shop())
+                             parse_mode="HTML", reply_markup=kb_main_shop(),
+                             disable_notification=True)
 
 
 
@@ -222,7 +269,7 @@ async def cmd_start(message: Message):
 
 # ─── Выбор даты — общая логика ────────────────────────────────────────────────
 async def show_calendar(message: Message, prompt: str = "📅 Выбери срок выполнения:"):
-    await message.answer(prompt, reply_markup=kb_date_pick())
+    await message.answer(prompt, reply_markup=kb_date_pick(), disable_notification=True)
 
 
 @dp.callback_query(F.data == "cal_ignore")
@@ -248,9 +295,9 @@ async def cmd_newtask(message: Message, state: FSMContext):
         return
     await state.update_data(assignees=[])
     await message.answer("👇 Выбери исполнителей (можно несколько):",
-                         reply_markup=kb_assignee_select([]))
+                         reply_markup=kb_assignee_select([]),
+                         disable_notification=True)
     await state.set_state(NewTask.choosing_assignees)
-
 
 @dp.callback_query(F.data.startswith("asgn_"), NewTask.choosing_assignees)
 async def cb_toggle_assignee(callback: CallbackQuery, state: FSMContext):
@@ -264,6 +311,9 @@ async def cb_toggle_assignee(callback: CallbackQuery, state: FSMContext):
         names = [USERS[u]["name"] for u in selected if u in USERS]
         await callback.message.edit_text(
             f"✅ Исполнители: {', '.join(names)}\n\n📝 Введите текст задачи:")
+        await callback.message.answer("⌨️ Введите текст задачи:",
+                                      reply_markup=ReplyKeyboardRemove(),
+                                      disable_notification=True)
         await state.set_state(NewTask.entering_text)
         await callback.answer()
         return
@@ -282,6 +332,9 @@ async def cb_toggle_assignee(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(NewTask.entering_text)
 async def admin_task_text(message: Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        await message.answer("📝 Введите текст задачи:", reply_markup=ReplyKeyboardRemove())
+        return
     await state.update_data(text=message.text)
     await show_calendar(message)
     await state.set_state(NewTask.choosing_deadline)
@@ -358,8 +411,7 @@ async def _create_task_admin(message: Message, state: FSMContext, deadline_date)
         try:
             await bot.send_message(
                 a_uid,
-                f"📋 <b>Новая задача от {user['name']}</b>\n\n"
-                f"📝 {data['text']}\n📅 Срок: {deadline_text}\n🆔 Задача #{task_id}",
+                f"📋 <b>Новая задача от {user['name']}</b>\n\n" + format_task_card(task),
                 parse_mode="HTML",
                 reply_markup=kb_task_action(task_id)
             )
@@ -370,7 +422,7 @@ async def _create_task_admin(message: Message, state: FSMContext, deadline_date)
 
     await message.answer(
         f"✅ Задача #{task_id} отправлена: {', '.join(sent_names)}",
-        reply_markup=kb_main_admin()
+        reply_markup=kb_main_admin(), disable_notification=True
     )
     await state.clear()
 
@@ -379,12 +431,16 @@ async def _create_task_admin(message: Message, state: FSMContext, deadline_date)
 @dp.message(F.text == "📌 Поставить задачу")
 async def btn_shop_task(message: Message, state: FSMContext):
     await message.answer("📝 Опишите задачу для руководителя:",
-                         reply_markup=ReplyKeyboardRemove())
+                         reply_markup=ReplyKeyboardRemove(),
+                         disable_notification=True)
     await state.set_state(ShopTask.entering_text)
 
 
 @dp.message(ShopTask.entering_text)
 async def shop_task_text(message: Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        await message.answer("📝 Опишите задачу:")
+        return
     await state.update_data(text=message.text)
     await show_calendar(message, "📅 Выбери желаемый срок:")
     await state.set_state(ShopTask.choosing_deadline)
@@ -461,19 +517,23 @@ async def _create_task_shop(message: Message, state: FSMContext, deadline_date):
         reply_markup=kb_task_action(task_id)
     )
     await message.answer(f"✅ Задача #{task_id} отправлена руководителю.",
-                         reply_markup=kb_main_shop())
+                         reply_markup=kb_main_shop(), disable_notification=True)
     await state.clear()
 
 
 # ─── SHOP: Вопрос (без дедлайна) ─────────────────────────────────────────────
 @dp.message(F.text == "❓ Вопрос руководителю")
 async def btn_question(message: Message, state: FSMContext):
-    await message.answer("❓ Напишите вопрос:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("❓ Напишите вопрос:", reply_markup=ReplyKeyboardRemove(),
+                         disable_notification=True)
     await state.set_state(ShopQuestion.entering_text)
 
 
 @dp.message(ShopQuestion.entering_text)
 async def shop_question_text(message: Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        await message.answer("❓ Напишите вопрос:", reply_markup=ReplyKeyboardRemove())
+        return
     uid = str(message.from_user.id)
     user = get_user(uid)
     task_id = next_task_id()
@@ -504,12 +564,46 @@ async def shop_question_text(message: Message, state: FSMContext):
     await state.clear()
 
 
+@dp.callback_query(F.data.startswith("skip_report_"))
+async def cb_skip_report(callback: CallbackQuery, state: FSMContext):
+    task_id = int(callback.data.replace("skip_report_", ""))
+    task = tasks.get(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+    uid = str(callback.from_user.id)
+    user = get_user(uid)
+    if uid not in task["confirmed_by"]:
+        task["confirmed_by"].append(uid)
+    task["iterations"] += 1
+    task["status"] = "checking"
+    caption = (
+        f"🔔 <b>{user['name'] if user else uid} отчитался по задаче #{task_id}</b>\n\n"
+        f"📝 {task['text']}\n🔁 Итерация: {task['iterations']}\n"
+        f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"💬 <i>Без комментария</i>"
+    )
+    await bot.send_message(ADMIN_ID, caption, parse_mode="HTML",
+                           reply_markup=kb_control(task_id))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("✅ Отчёт отправлен. Ожидайте проверки.",
+                                  reply_markup=kb_main_shop())
+    await state.clear()
+    await callback.answer()
+
+
 # ─── Выполнено → отчёт ────────────────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("done_"))
 async def cb_done(callback: CallbackQuery, state: FSMContext):
     task_id = int(callback.data.replace("done_", ""))
     await state.update_data(task_id=task_id)
-    await callback.message.answer("📷 Пришлите фото результата и/или напишите комментарий:")
+    await callback.message.answer(
+        "📷 Пришлите фото результата и/или напишите комментарий:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭️ Пропустить", callback_data=f"skip_report_{task_id}")]
+        ]),
+        disable_notification=True
+    )
     await state.set_state(ShopReport.waiting_report)
     await callback.answer()
 
@@ -555,7 +649,7 @@ async def shop_report_received(message: Message, state: FSMContext):
                                reply_markup=kb_control(task_id))
 
     await message.answer("✅ Отчёт отправлен. Ожидайте проверки.",
-                         reply_markup=kb_main_shop())
+                         reply_markup=kb_main_shop(), disable_notification=True)
     await state.clear()
 
 
@@ -580,7 +674,7 @@ async def cb_approve(callback: CallbackQuery):
             logging.warning(f"Notify error: {e}")
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(f"✅ Задача #{task_id} закрыта.",
-                                  reply_markup=kb_main_admin())
+                                  reply_markup=kb_main_admin(), disable_notification=True)
     await callback.answer()
 
 
@@ -589,7 +683,8 @@ async def cb_approve(callback: CallbackQuery):
 async def cb_return(callback: CallbackQuery, state: FSMContext):
     task_id = int(callback.data.replace("return_", ""))
     await state.update_data(task_id=task_id)
-    await callback.message.answer(f"✏️ Опишите замечания по задаче #{task_id}:")
+    await callback.message.answer(f"✏️ Опишите замечания по задаче #{task_id}:",
+                                  disable_notification=True)
     await state.set_state(ReturnTask.entering_remarks)
     await callback.answer()
 
@@ -613,11 +708,12 @@ async def return_remarks_entered(message: Message, state: FSMContext):
         try:
             await bot.send_message(a_uid,
                 f"🔄 <b>Задача #{task_id} возвращена на доработку</b>\n\n"
-                f"📝 {task['text']}\n\n❗ Замечания:\n{remarks}",
+                + format_task_card(task),
                 parse_mode="HTML", reply_markup=kb_task_action(task_id))
         except Exception as e:
             logging.warning(f"Notify error: {e}")
-    await message.answer(f"🔄 Задача #{task_id} возвращена.", reply_markup=kb_main_admin())
+    await message.answer(f"🔄 Задача #{task_id} возвращена.", reply_markup=kb_main_admin(),
+                         disable_notification=True)
     await state.clear()
 
 
@@ -632,7 +728,7 @@ async def cb_edit_text(callback: CallbackQuery, state: FSMContext):
     await state.update_data(task_id=task_id)
     await callback.message.answer(
         f"✏️ Текущий текст:\n<i>{task['text']}</i>\n\nВведите новый текст:",
-        parse_mode="HTML")
+        parse_mode="HTML", disable_notification=True)
     await state.set_state(EditTask.entering_new_text)
     await callback.answer()
 
@@ -656,7 +752,8 @@ async def edit_text_entered(message: Message, state: FSMContext):
                 parse_mode="HTML", reply_markup=kb_task_action(task_id))
         except Exception as e:
             logging.warning(f"Notify error: {e}")
-    await message.answer(f"✅ Текст задачи #{task_id} обновлён.", reply_markup=kb_main_admin())
+    await message.answer(f"✅ Текст задачи #{task_id} обновлён.", reply_markup=kb_main_admin(),
+                         disable_notification=True)
     await state.clear()
 
 
@@ -670,7 +767,7 @@ async def cb_edit_date(callback: CallbackQuery, state: FSMContext):
     await state.update_data(task_id=task_id)
     await callback.message.answer(
         f"📅 Текущий срок: <i>{deadline_str(task)}</i>\n\nВыбери новый срок:",
-        parse_mode="HTML", reply_markup=kb_date_pick())
+        parse_mode="HTML", reply_markup=kb_date_pick(), disable_notification=True)
     await state.set_state(EditTask.choosing_new_deadline)
     await callback.answer()
 
@@ -693,7 +790,8 @@ async def edit_date_none(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "cal_manual", EditTask.choosing_new_deadline)
 async def edit_date_manual(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("✏️ Введите дату: ДД.ММ или ДД.ММ.ГГГГ")
+    await callback.message.answer("✏️ Введите дату: ДД.ММ или ДД.ММ.ГГГГ",
+                                  disable_notification=True)
     await state.set_state(EditTask.entering_manual_new_deadline)
     await callback.answer()
 
@@ -728,7 +826,7 @@ async def _apply_new_deadline(message: Message, state: FSMContext, new_date):
         except Exception as e:
             logging.warning(f"Notify error: {e}")
     await message.answer(f"✅ Срок задачи #{task_id} обновлён: {deadline_text}",
-                         reply_markup=kb_main_admin())
+                         reply_markup=kb_main_admin(), disable_notification=True)
     await state.clear()
 
 
@@ -753,7 +851,7 @@ async def cb_force_close(callback: CallbackQuery):
             logging.warning(f"Notify error: {e}")
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(f"🔴 Задача #{task_id} принудительно закрыта.",
-                                  reply_markup=kb_main_admin())
+                                  reply_markup=kb_main_admin(), disable_notification=True)
     await callback.answer()
 
 
@@ -765,7 +863,8 @@ async def btn_filter_status(message: Message):
         return
     status_map = {"🕐 В работе": "open", "🔍 На проверке": "checking", "✅ Выполненные": "done"}
     status_key = status_map[message.text]
-    await message.answer("Показать для кого?", reply_markup=kb_filter_person(status_key))
+    await message.answer("Показать для кого?", reply_markup=kb_filter_person(status_key),
+                         disable_notification=True)
 
 
 @dp.callback_query(F.data.startswith("flt_"))
@@ -783,21 +882,26 @@ async def cb_filter_tasks(callback: CallbackQuery):
         return
     label = status_labels.get(status_key, status_key)
     person_label = "все" if person == "all" else (get_user(person) or {}).get("name", person)
-    text = f"<b>{label} — {person_label}</b>\n\n"
-    for t in filtered:
-        names = [USERS[a]["name"] for a in t["assignees"] if a in USERS and a != ADMIN_ID]
-        overdue = " 🔴" if is_overdue(t) else ""
-        force = " [закрыта]" if t.get("force_closed") else ""
-        tag = "❓" if t.get("type") == "question" else "📌" if t.get("from_uid") != ADMIN_ID else "📋"
-        text += (
-            f"{tag} <b>#{t['id']}</b>{overdue}{force} "
-            f"{t['text'][:50]}{'...' if len(t['text']) > 50 else ''}\n"
-            f"   👤 {', '.join(names) or t['from_name']} | 📅 {deadline_str(t)}\n\n"
-        )
-    if status_key in ("open", "checking") and len(filtered) == 1:
-        await callback.message.edit_text(text, parse_mode="HTML",
-                                         reply_markup=kb_edit_task(filtered[0]["id"]))
+
+    if status_key in ("open", "checking"):
+        await callback.message.edit_text(f"<b>{label} — {person_label}</b>", parse_mode="HTML")
+        for t in filtered:
+            text = format_task_card(t)
+            kb = kb_control(t["id"]) if status_key == "checking" else kb_edit_task(t["id"])
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=kb,
+                                          disable_notification=True)
     else:
+        # Выполненные — одним списком
+        text = f"<b>{label} — {person_label}</b>\n\n"
+        for t in filtered:
+            names = [USERS[a]["name"] for a in t["assignees"] if a in USERS and a != ADMIN_ID]
+            force = " [закрыта]" if t.get("force_closed") else ""
+            tag = "❓" if t.get("type") == "question" else "📌" if t.get("from_uid") != ADMIN_ID else "📋"
+            text += (
+                f"{tag} <b>#{t['id']}</b>{force} "
+                f"{t['text'][:50]}{'...' if len(t['text']) > 50 else ''}\n"
+                f"   👤 {', '.join(names) or t['from_name']} | 📅 {deadline_str(t)}\n\n"
+            )
         await callback.message.edit_text(text, parse_mode="HTML")
     await callback.answer()
 
@@ -808,12 +912,31 @@ async def btn_my_tasks(message: Message):
     user = get_user(uid)
     if not user:
         return
-    tasks_text = format_my_tasks(uid)
+    kb = kb_main_admin() if is_admin(uid) else kb_main_shop()
+    my_tasks = [t for t in tasks.values()
+                if uid in t.get("assignees", []) and t["status"] != "done"]
     done_count = sum(1 for t in tasks.values()
                      if uid in t.get("assignees", []) and t["status"] == "done")
+    if not my_tasks:
+        text = "✅ Активных задач нет."
+        if done_count:
+            text += f"\n✅ Выполнено всего: {done_count}"
+        await message.answer(text, reply_markup=kb, disable_notification=True)
+        return
+    header = f"<b>Мои активные задачи:</b>"
     if done_count:
-        tasks_text += f"\n✅ Выполнено всего: {done_count}"
-    await message.answer(tasks_text, parse_mode="HTML", reply_markup=kb_main_shop())
+        header += f" (выполнено: {done_count})"
+    await message.answer(header, parse_mode="HTML", reply_markup=kb, disable_notification=True)
+    for t in my_tasks:
+        text = format_task_card(t)
+        if t["status"] == "checking" and is_admin(uid):
+            task_kb = kb_control(t["id"])
+        elif not is_admin(uid):
+            task_kb = kb_task_action(t["id"])
+        else:
+            task_kb = kb_edit_task(t["id"])
+        await message.answer(text, parse_mode="HTML", reply_markup=task_kb,
+                             disable_notification=True)
 
 
 @dp.message(F.text == "📊 Отчёт")
@@ -843,7 +966,142 @@ async def cmd_report(message: Message):
             ov = sum(1 for t in p_tasks if is_overdue(t))
             overdue_str = f" 🔴{ov}" if ov else ""
             text += f"  {p_user['name']}: 🕐{o} ✅{d}{overdue_str}\n"
-    await message.answer(text, parse_mode="HTML", reply_markup=kb_main_admin())
+    await message.answer(text, parse_mode="HTML", reply_markup=kb_main_admin(),
+                         disable_notification=True)
+
+
+
+# ─── Комментарии к задачам ────────────────────────────────────────────────────
+@dp.callback_query(F.data.startswith("history_"))
+async def cb_history(callback: CallbackQuery):
+    task_id = int(callback.data.replace("history_", ""))
+    task = tasks.get(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+    comments = task.get("comments", [])
+    remarks = task.get("remarks", [])
+    if not comments and not remarks:
+        await callback.answer("Комментариев пока нет.", show_alert=True)
+        return
+    text = f"📜 <b>История задачи #{task_id}</b>\n\n"
+    # Замечания при возврате
+    for r in remarks:
+        text += f"🔄 <b>Замечание</b> [{r['at']}]\n{r['text']}\n\n"
+    # Комментарии
+    for c in comments:
+        photo_icon = "📷 " if c.get("has_photo") else ""
+        text += f"💬 <b>{c['from']}</b> [{c['at']}]\n{photo_icon}{c['text']}\n\n"
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("comment_"))
+async def cb_comment(callback: CallbackQuery, state: FSMContext):
+    task_id = int(callback.data.replace("comment_", ""))
+    task = tasks.get(task_id)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+    await state.update_data(task_id=task_id)
+    short = task['text'][:60] + ('...' if len(task['text']) > 60 else '')
+    await callback.message.answer(
+        f"💬 Напишите комментарий к задаче #{task_id}:\n"
+        f"<i>{short}</i>\n\n"
+        "Можно прикрепить фото.",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddComment.waiting_comment)
+    await callback.answer()
+
+
+@dp.message(AddComment.waiting_comment)
+async def comment_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data["task_id"]
+    task = tasks.get(task_id)
+    if not task:
+        await message.answer("Задача не найдена.")
+        await state.clear()
+        return
+
+    uid = str(message.from_user.id)
+    user = get_user(uid)
+    name = user["name"] if user else uid
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    # Сохраняем комментарий в истории задачи
+    comment_entry = {
+        "from": name,
+        "from_uid": uid,
+        "text": message.text or message.caption or "",
+        "has_photo": bool(message.photo),
+        "at": now,
+    }
+    if "comments" not in task:
+        task["comments"] = []
+    task["comments"].append(comment_entry)
+
+    short2 = task['text'][:50] + ('...' if len(task['text']) > 50 else '')
+    caption = (
+        f"💬 <b>Комментарий от {name}</b>\n"
+        f"Задача #{task_id}: {short2}\n"
+        f"🕐 {now}"
+    )
+    if message.text:
+        caption += f"\n\n{message.text}"
+    elif message.caption:
+        caption += f"\n\n{message.caption}"
+
+    # Отправляем только исполнителям задачи (не себе)
+    recipients = set(a for a in task["assignees"] if a != ADMIN_ID)
+    recipients.discard(uid)  # себе не отправляем
+
+    for r_uid in recipients:
+        try:
+            if message.photo:
+                await bot.send_photo(
+                    r_uid,
+                    photo=message.photo[-1].file_id,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=kb_task_action(task_id)
+                )
+            else:
+                await bot.send_message(
+                    r_uid,
+                    caption,
+                    parse_mode="HTML",
+                    reply_markup=kb_task_action(task_id)
+                )
+        except Exception as e:
+            logging.warning(f"Comment notify error to {r_uid}: {e}")
+
+    # Если комментарий пишет исполнитель — уведомить руководителя
+    if uid != ADMIN_ID:
+        try:
+            if message.photo:
+                await bot.send_photo(
+                    ADMIN_ID,
+                    photo=message.photo[-1].file_id,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=kb_control(task_id)
+                )
+            else:
+                await bot.send_message(
+                    ADMIN_ID,
+                    caption,
+                    parse_mode="HTML",
+                    reply_markup=kb_control(task_id)
+                )
+        except Exception as e:
+            logging.warning(f"Comment notify admin error: {e}")
+
+    kb = kb_main_admin() if is_admin(uid) else kb_main_shop()
+    await message.answer("✅ Комментарий отправлен.", reply_markup=kb,
+                         disable_notification=True)
+    await state.clear()
 
 
 # ─── Планировщик уведомлений ──────────────────────────────────────────────────
